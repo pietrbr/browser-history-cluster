@@ -4,10 +4,12 @@ from collections import defaultdict
 from pathlib import Path
 from urllib.parse import urlparse
 
+import hdbscan
 import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.mixture import GaussianMixture
 from sklearn.preprocessing import StandardScaler
 
 # ============================================================================
@@ -431,11 +433,11 @@ def find_optimal_clusters(
     return optimal_k, inertias
 
 
-def cluster_history(history_data, n_clusters=10,
-                    domain_weight=DEFAULT_DOMAIN_WEIGHT,
-                    path_weight=DEFAULT_PATH_WEIGHT,
-                    title_weight=DEFAULT_TITLE_WEIGHT,
-                    use_numerical_features=USE_NUMERICAL_FEATURES):
+def cluster_history_kmeans(history_data, n_clusters=10,
+                           domain_weight=DEFAULT_DOMAIN_WEIGHT,
+                           path_weight=DEFAULT_PATH_WEIGHT,
+                           title_weight=DEFAULT_TITLE_WEIGHT,
+                           use_numerical_features=USE_NUMERICAL_FEATURES):
     """Cluster browser history using K-means on TF-IDF features"""
     if not history_data:
         print("No history data to cluster")
@@ -453,6 +455,263 @@ def cluster_history(history_data, n_clusters=10,
     clusters = kmeans.fit_predict(X)
 
     return clusters, urls, titles
+
+
+def cluster_history_gmm(history_data, n_clusters=10,
+                        domain_weight=DEFAULT_DOMAIN_WEIGHT,
+                        path_weight=DEFAULT_PATH_WEIGHT,
+                        title_weight=DEFAULT_TITLE_WEIGHT,
+                        use_numerical_features=USE_NUMERICAL_FEATURES):
+    """Cluster browser history using Gaussian Mixture Model (soft clustering)
+
+    GMM allows probabilistic cluster assignments - items can partially belong
+    to multiple clusters. Good for pages that span multiple topics.
+    """
+    if not history_data:
+        print("No history data to cluster")
+        return
+
+    # Prepare features
+    X, urls, titles = prepare_features(history_data, domain_weight, path_weight, title_weight,
+                                       use_numerical_features)
+
+    # Adjust number of clusters if we have less data
+    n_clusters = min(n_clusters, len(X))
+
+    # Perform GMM clustering
+    print(f"\nClustering with Gaussian Mixture Model (n_components={n_clusters})...")
+    gmm = GaussianMixture(n_components=n_clusters, random_state=42, covariance_type='full')
+    clusters = gmm.fit_predict(X)
+
+    # Get probabilities for soft clustering
+    probabilities = gmm.predict_proba(X)
+
+    # Calculate cluster quality metrics
+    bic = gmm.bic(X)
+    aic = gmm.aic(X)
+    print(f"GMM BIC: {bic:.2f}, AIC: {aic:.2f} (lower is better)")
+
+    return clusters, urls, titles, probabilities
+
+
+def cluster_history_hdbscan(history_data,
+                            domain_weight=DEFAULT_DOMAIN_WEIGHT,
+                            path_weight=DEFAULT_PATH_WEIGHT,
+                            title_weight=DEFAULT_TITLE_WEIGHT,
+                            use_numerical_features=USE_NUMERICAL_FEATURES,
+                            min_cluster_size=5):
+    """Cluster browser history using HDBSCAN (density-based, hierarchical)
+
+    HDBSCAN automatically determines the number of clusters and marks outliers
+    as noise (cluster -1). Good for finding natural groupings without
+    specifying k in advance.
+
+    Args:
+        min_cluster_size: Minimum number of points in a cluster (default 5)
+    """
+    if not history_data:
+        print("No history data to cluster")
+        return
+
+    # Prepare features
+    X, urls, titles = prepare_features(history_data, domain_weight, path_weight, title_weight,
+                                       use_numerical_features)
+
+    # Perform HDBSCAN clustering
+    print(f"\nClustering with HDBSCAN (min_cluster_size={min_cluster_size})...")
+    clusterer = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size, min_samples=1)
+    clusters = clusterer.fit_predict(X)
+
+    # Count clusters (excluding noise points marked as -1)
+    n_clusters = len(set(clusters)) - (1 if -1 in clusters else 0)
+    n_noise = list(clusters).count(-1)
+
+    print(f"HDBSCAN found {n_clusters} clusters")
+    print(f"Noise points (outliers): {n_noise} ({n_noise/len(clusters)*100:.1f}%)")
+
+    # Cluster quality metrics
+    if hasattr(clusterer, 'cluster_persistence_'):
+        print("Cluster persistence scores available")
+
+    return clusters, urls, titles
+
+
+def find_optimal_hdbscan_params(history_data,
+                                min_cluster_sizes=[50, 100, 200],
+                                domain_weight=DEFAULT_DOMAIN_WEIGHT,
+                                path_weight=DEFAULT_PATH_WEIGHT,
+                                title_weight=DEFAULT_TITLE_WEIGHT,
+                                use_numerical_features=USE_NUMERICAL_FEATURES):
+    """Find optimal min_cluster_size parameter for HDBSCAN
+
+    Tests different min_cluster_size values and returns clustering quality metrics
+
+    Args:
+        min_cluster_sizes: List of min_cluster_size values to test (default [50, 100, 200])
+    """
+    print(f"\nFinding optimal HDBSCAN parameters (testing min_cluster_size={min_cluster_sizes})...")
+
+    # Prepare features
+    X, urls, titles = prepare_features(history_data, domain_weight, path_weight, title_weight,
+                                       use_numerical_features)
+
+    results = []
+
+    for min_size in min_cluster_sizes:
+        print(f"\n  Testing min_cluster_size={min_size}...", end=' ')
+
+        clusterer = hdbscan.HDBSCAN(min_cluster_size=min_size, min_samples=1)
+        clusters = clusterer.fit_predict(X)
+
+        # Count clusters and noise
+        n_clusters = len(set(clusters)) - (1 if -1 in clusters else 0)
+        n_noise = list(clusters).count(-1)
+        noise_pct = n_noise / len(clusters) * 100
+
+        # Calculate cluster sizes (excluding noise)
+        from collections import Counter
+        cluster_sizes = Counter([c for c in clusters if c != -1])
+
+        avg_size = np.mean(list(cluster_sizes.values())) if cluster_sizes else 0
+        min_cluster = min(cluster_sizes.values()) if cluster_sizes else 0
+        max_cluster = max(cluster_sizes.values()) if cluster_sizes else 0
+
+        results.append({
+            'min_cluster_size': min_size,
+            'n_clusters': n_clusters,
+            'n_noise': n_noise,
+            'noise_pct': noise_pct,
+            'avg_cluster_size': avg_size,
+            'min_cluster': min_cluster,
+            'max_cluster': max_cluster,
+            'clusters': clusters
+        })
+
+        print(f"Found {n_clusters} clusters, Noise: {n_noise} ({noise_pct:.1f}%)")
+
+    # Print comparison table
+    print(f"\n{'='*80}")
+    print("HDBSCAN PARAMETER COMPARISON")
+    print(f"{'='*80}")
+    print(f"{'min_size':<12} {'Clusters':<10} {'Noise':<10} {'Noise %':<10} {'Avg Size':<10}")
+    print("-" * 80)
+
+    for r in results:
+        print(f"{r['min_cluster_size']:<12} {r['n_clusters']:<10} {r['n_noise']:<10} "
+              f"{r['noise_pct']:<10.1f} {r['avg_cluster_size']:<10.1f}")
+
+    # Recommend parameter with lowest noise but reasonable number of clusters
+    # Prefer fewer noise points while maintaining some granularity
+    best = min(results, key=lambda x: x['noise_pct'])
+
+    print(f"\n{'='*80}")
+    print(f"RECOMMENDED: min_cluster_size={best['min_cluster_size']} "
+          f"({best['n_clusters']} clusters, {best['noise_pct']:.1f}% noise)")
+    print(f"{'='*80}")
+
+    return best['min_cluster_size'], results
+
+
+def compare_clustering_algorithms(history_data, n_clusters=10, hdbscan_min_size=None):
+    """Compare K-means, GMM, and HDBSCAN on the same dataset
+
+    Returns results from all three algorithms for comparison
+
+    Args:
+        n_clusters: Number of clusters for K-means and GMM (from elbow method)
+        hdbscan_min_size: min_cluster_size for HDBSCAN (if None, uses parameter sweep)
+    """
+    print("\n" + "="*80)
+    print("COMPARING CLUSTERING ALGORITHMS")
+    print("="*80)
+
+    results = {}
+
+    # 1. K-means
+    print("\n[1/4] Running K-means...")
+    kmeans_result = cluster_history_kmeans(history_data, n_clusters=n_clusters)
+    if kmeans_result:
+        results['kmeans'] = {
+            'clusters': kmeans_result[0],
+            'urls': kmeans_result[1],
+            'titles': kmeans_result[2],
+            'n_clusters': n_clusters
+        }
+
+    # 2. GMM (uses same k as K-means)
+    print("\n[2/4] Running Gaussian Mixture Model (using k={})...".format(n_clusters))
+    gmm_result = cluster_history_gmm(history_data, n_clusters=n_clusters)
+    if gmm_result:
+        results['gmm'] = {
+            'clusters': gmm_result[0],
+            'urls': gmm_result[1],
+            'titles': gmm_result[2],
+            'probabilities': gmm_result[3],
+            'n_clusters': n_clusters
+        }
+
+    # 3. HDBSCAN parameter sweep (if not specified)
+    if hdbscan_min_size is None:
+        print("\n[3/4] Finding optimal HDBSCAN parameters...")
+        hdbscan_min_size, _ = find_optimal_hdbscan_params(history_data,
+                                                          min_cluster_sizes=[50, 100, 200])
+
+    # 4. HDBSCAN with optimal/specified parameter
+    print(f"\n[4/4] Running HDBSCAN with min_cluster_size={hdbscan_min_size}...")
+    hdbscan_result = cluster_history_hdbscan(history_data, min_cluster_size=hdbscan_min_size)
+    if hdbscan_result:
+        n_found = len(set(hdbscan_result[0])) - (1 if -1 in hdbscan_result[0] else 0)
+        results['hdbscan'] = {
+            'clusters': hdbscan_result[0],
+            'urls': hdbscan_result[1],
+            'titles': hdbscan_result[2],
+            'n_clusters': n_found,
+            'min_cluster_size': hdbscan_min_size
+        }
+
+    # Print comparison summary
+    print("\n" + "="*80)
+    print("COMPARISON SUMMARY")
+    print("="*80)
+
+    print(f"\n{'Algorithm':<15} {'Clusters':<12} {'Noise':<12} {'Min Size':<10} {'Max Size':<10} {'Avg Size':<10}")
+    print("-" * 80)
+
+    for algo_name, result in results.items():
+        clusters = result['clusters']
+        n_clusters = result['n_clusters']
+
+        # Calculate cluster sizes
+        from collections import Counter
+        cluster_sizes = Counter(clusters)
+
+        # Remove noise cluster for HDBSCAN if present
+        noise_info = ""
+        if -1 in cluster_sizes:
+            noise_count = cluster_sizes[-1]
+            del cluster_sizes[-1]
+            noise_info = f"{noise_count} ({noise_count/len(clusters)*100:.1f}%)"
+        else:
+            noise_info = "0 (0.0%)"
+
+        avg_size = np.mean(list(cluster_sizes.values())) if cluster_sizes else 0
+        min_size = min(cluster_sizes.values()) if cluster_sizes else 0
+        max_size = max(cluster_sizes.values()) if cluster_sizes else 0
+
+        algo_display = algo_name.upper()
+        if algo_name == 'hdbscan' and 'min_cluster_size' in result:
+            algo_display += f" (mcs={result['min_cluster_size']})"
+
+        print(f"{algo_display:<15} {n_clusters:<12} {noise_info:<12} {min_size:<10} {max_size:<10} {avg_size:<10.1f}")
+
+    print("\n" + "="*80)
+    print("Notes:")
+    print("  - K-means and GMM use optimal k from elbow method")
+    print("  - HDBSCAN automatically determines number of clusters")
+    print("  - HDBSCAN 'Noise' are outliers that don't fit any cluster well")
+    print("="*80)
+
+    return results
 
 
 def display_clusters(clusters, urls, titles, history_data):
@@ -487,6 +746,9 @@ def main():
     print("Browser History Clustering")
     print("="*80)
 
+    # Configuration option: set to True to compare all algorithms
+    COMPARE_ALGORITHMS = True  # Set to False to use only K-means
+
     # Check if history file exists
     if not HISTORY_PATH.exists():
         print(f"Error: History file not found at {HISTORY_PATH}")
@@ -513,15 +775,31 @@ def main():
         else:
             print("\nClustering mode: Individual visits")
 
-        # Find optimal number of clusters using elbow method
-        optimal_k, _ = find_optimal_clusters(history_data)
+        if COMPARE_ALGORITHMS:
+            # Compare all three algorithms
+            # Find optimal k for K-means and GMM
+            optimal_k, _ = find_optimal_clusters(history_data)
 
-        # Cluster the history with optimal k
-        print(f"\nClustering history entries with k={optimal_k}...")
-        clusters, urls, titles = cluster_history(history_data, n_clusters=optimal_k)
+            # Run comparison
+            results = compare_clustering_algorithms(history_data, n_clusters=optimal_k)
 
-        # Display results
-        display_clusters(clusters, urls, titles, history_data)
+            # Display results for each algorithm
+            for algo_name, result in results.items():
+                print(f"\n{'='*80}")
+                print(f"RESULTS FOR {algo_name.upper()}")
+                print(f"{'='*80}")
+                display_clusters(result['clusters'], result['urls'], result['titles'], history_data)
+        else:
+            # Standard K-means only
+            # Find optimal number of clusters using elbow method
+            optimal_k, _ = find_optimal_clusters(history_data)
+
+            # Cluster the history with optimal k
+            print(f"\nClustering history entries with k={optimal_k}...")
+            clusters, urls, titles = cluster_history_kmeans(history_data, n_clusters=optimal_k)
+
+            # Display results
+            display_clusters(clusters, urls, titles, history_data)
 
     finally:
         # Clean up temporary file
